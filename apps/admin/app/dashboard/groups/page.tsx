@@ -1,59 +1,63 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { adminFetch } from "../_api";
+import { adminGetGroups } from "../_api";
 
-type Row = {
+type GroupRow = {
   telegram_chat_id: number;
   title: string | null;
-  updated_at: string;
+  updated_at?: string;
 };
 
 export default function GroupsPage() {
-  const [rows, setRows] = useState<Row[]>([]);
+  const [rows, setRows] = useState<GroupRow[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
-      setErr(null);
-      const res = await adminFetch("/admin/tg/groups");
-      if (!res.ok) {
-        setErr(`Failed: ${res.status}`);
-        return;
+      try {
+        const data = await adminGetGroups();
+        setRows(Array.isArray(data) ? data : []);
+      } catch (e: any) {
+        setErr(e?.message || "Failed to load groups");
       }
-      setRows(await res.json());
     })();
   }, []);
 
   return (
-    <div className="p-6">
-      <h1 className="text-2xl font-semibold">Telegram Groups</h1>
+    <div style={{ padding: 16 }}>
+      <h1 style={{ fontSize: 20, fontWeight: 700 }}>Groups</h1>
 
-      {err && <div className="mt-4 text-sm text-red-600">{err}</div>}
+      {err && <pre>{err}</pre>}
 
-      <div className="mt-6 overflow-auto rounded-2xl border">
-        <table className="min-w-[700px] w-full text-sm">
-          <thead className="bg-gray-50">
+      {rows.length === 0 ? (
+        <div style={{ marginTop: 20 }}>
+          No groups found.
+          <br /><br />
+          Botu gruptan çıkarıp tekrar ekle.
+          <br />
+          Botu admin yapman önerilir.
+        </div>
+      ) : (
+        <table style={{ width: "100%", marginTop: 20 }}>
+          <thead>
             <tr>
-              <th className="p-3 text-left">Chat ID</th>
-              <th className="p-3 text-left">Title</th>
-              <th className="p-3 text-left">Updated</th>
+              <th>Title</th>
+              <th>Chat ID</th>
+              <th>Updated</th>
             </tr>
           </thead>
           <tbody>
-            {rows.map((r) => (
-              <tr key={r.telegram_chat_id} className="border-t">
-                <td className="p-3">{r.telegram_chat_id}</td>
-                <td className="p-3">{r.title || "-"}</td>
-                <td className="p-3">{new Date(r.updated_at).toLocaleString()}</td>
+            {rows.map(r => (
+              <tr key={r.telegram_chat_id}>
+                <td>{r.title || "-"}</td>
+                <td>{r.telegram_chat_id}</td>
+                <td>{r.updated_at ? new Date(r.updated_at).toLocaleString() : "-"}</td>
               </tr>
             ))}
-            {rows.length === 0 && (
-              <tr><td className="p-3" colSpan={3}>No groups yet.</td></tr>
-            )}
           </tbody>
         </table>
-      </div>
+      )}
     </div>
   );
 }
