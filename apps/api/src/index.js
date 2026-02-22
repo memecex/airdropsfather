@@ -8,10 +8,7 @@ import pkg from "pg";
 const { Pool } = pkg;
 
 const app = express();
-app.use(cors({
-  origin: "*",
-  credentials: true
-}));
+app.use(cors({ origin: "*" }));
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
