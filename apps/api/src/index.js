@@ -14,16 +14,33 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "devsecret";
 const DATABASE_URL = process.env.DATABASE_URL;
-
 const BOT_API_KEY = process.env.BOT_API_KEY;
 
 if (!DATABASE_URL) {
   console.error("Missing DATABASE_URL");
   process.exit(1);
 }
-if (!BOT_API_KEY) console.warn("WARNING: Missing BOT_API_KEY (bot calls will be rejected).");
 
 const pool = new Pool({ connectionString: DATABASE_URL });
+
+function requireAdmin(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Missing token" });
+
+  try {
+    req.admin = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+function requireBotKey(req, res, next) {
+  const key = req.headers["x-bot-key"];
+  if (!BOT_API_KEY || key !== BOT_API_KEY) return res.status(401).json({ error: "Unauthorized" });
+  next();
+}
 
 async function ensureAdminUser() {
   await pool.query(`
@@ -37,8 +54,8 @@ async function ensureAdminUser() {
     );
   `);
 
-  const res = await pool.query("SELECT * FROM admin_users WHERE username=$1", ["admin"]);
-  if (res.rows.length === 0) {
+  const r = await pool.query("SELECT * FROM admin_users WHERE username=$1", ["admin"]);
+  if (r.rows.length === 0) {
     const hash = await bcrypt.hash("123123", 10);
     await pool.query(
       `INSERT INTO admin_users (username,email,password_hash) VALUES ($1,$2,$3)`,
@@ -48,7 +65,7 @@ async function ensureAdminUser() {
   }
 }
 
-async function ensureTelegramTablesAndViews() {
+async function ensureTelegramTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS telegram_users (
       id SERIAL PRIMARY KEY,
@@ -57,9 +74,41 @@ async function ensureTelegramTablesAndViews() {
       dm_opt_in BOOLEAN DEFAULT false,
       dm_pref TEXT DEFAULT 'ALL',
       x_handle TEXT,
+      onboarding_dm_set BOOLEAN DEFAULT false,
+      onboarding_done BOOLEAN DEFAULT false,
       created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW()
     );
+  `);
+
+  // Add missing columns safely (in case table existed)
+  await pool.query(`
+    ALTER TABLE telegram_users
+      ADD COLUMN IF NOT EXISTS onboarding_dm_set BOOLEAN DEFAULT false;
+  `);
+  await pool.query(`
+    ALTER TABLE telegram_users
+      ADD COLUMN IF NOT EXISTS onboarding_done BOOLEAN DEFAULT false;
+  `);
+
+  // ✅ Real SQL-based verified flag (stored, survives restarts)
+  // If it already exists, this will fail; so we do it in a DO block.
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='telegram_users' AND column_name='is_verified'
+      ) THEN
+        ALTER TABLE telegram_users
+        ADD COLUMN is_verified BOOLEAN
+        GENERATED ALWAYS AS (
+          (telegram_username IS NOT NULL AND telegram_username <> '')
+          AND
+          (x_handle IS NOT NULL AND x_handle <> '')
+        ) STORED;
+      END IF;
+    END $$;
   `);
 
   await pool.query(`
@@ -71,44 +120,79 @@ async function ensureTelegramTablesAndViews() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
+}
 
-  // ✅ SQL source of truth: verified = 1/0
+async function ensureGiveawayTables() {
   await pool.query(`
-    CREATE OR REPLACE VIEW telegram_users_v AS
-    SELECT
-      telegram_user_id,
-      telegram_username,
-      dm_opt_in,
-      dm_pref,
-      x_handle,
-      created_at,
-      updated_at,
-      CASE
-        WHEN telegram_username IS NOT NULL AND telegram_username <> ''
-         AND x_handle IS NOT NULL AND x_handle <> ''
-        THEN 1 ELSE 0
-      END AS is_verified
-    FROM telegram_users;
+    CREATE TABLE IF NOT EXISTS giveaways (
+      id SERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT,
+      x_account TEXT NOT NULL,
+      x_post_url TEXT NOT NULL,
+      x_post_id TEXT,
+      status TEXT NOT NULL DEFAULT 'DRAFT',
+      winners_count INT NOT NULL DEFAULT 1,
+      announce_in_tg BOOLEAN DEFAULT true,
+      announce_in_x BOOLEAN DEFAULT true,
+      tg_chat_id BIGINT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
   `);
-}
 
-function requireBotKey(req, res, next) {
-  const key = req.headers["x-bot-key"];
-  if (!BOT_API_KEY || key !== BOT_API_KEY) return res.status(401).json({ error: "Unauthorized" });
-  next();
-}
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS giveaway_tasks (
+      id SERIAL PRIMARY KEY,
+      giveaway_id INT NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
+      type TEXT NOT NULL,
+      payload JSONB DEFAULT '{}'::jsonb,
+      is_required BOOLEAN DEFAULT true,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
 
-function requireAdmin(req, res, next) {
-  const auth = req.headers.authorization || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-  if (!token) return res.status(401).json({ error: "Missing token" });
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS giveaway_entries (
+      id SERIAL PRIMARY KEY,
+      giveaway_id INT NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
+      x_handle TEXT,
+      telegram_user_id BIGINT,
+      telegram_username TEXT,
+      wallet_address TEXT,
+      discord_handle TEXT,
+      comment_id TEXT,
+      is_eligible BOOLEAN DEFAULT false,
+      checked_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
 
-  try {
-    req.admin = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({ error: "Invalid token" });
-  }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS giveaway_winners (
+      id SERIAL PRIMARY KEY,
+      giveaway_id INT NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
+      entry_id INT NOT NULL REFERENCES giveaway_entries(id) ON DELETE CASCADE,
+      position INT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS system_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    INSERT INTO system_settings (key, value)
+    VALUES
+      ('SITE_TITLE','AirdropsFather'),
+      ('SITE_DESC','Giveaway engine with verified participants')
+    ON CONFLICT (key) DO NOTHING;
+  `);
 }
 
 app.get("/", (_req, res) => res.json({ status: "API running" }));
@@ -126,40 +210,91 @@ app.post("/auth/login", async (req, res) => {
   res.json({ token, mustChangePassword: user.must_change_password });
 });
 
-/* ---------------- bot -> api ---------------- */
+/* ---------------- BOT APIs ---------------- */
 
+// ✅ upsert DOES NOT overwrite fields unless they are provided
 app.post("/tg/users/upsert", requireBotKey, async (req, res) => {
-  const { telegramUserId, telegramUsername, dmOptIn, dmPref, xHandle } = req.body || {};
+  const body = req.body || {};
+  const telegramUserId = body.telegramUserId;
+  const telegramUsername = body.telegramUsername ?? null;
+
   if (!telegramUserId) return res.status(400).json({ error: "telegramUserId required" });
 
+  const hasDmOptIn = Object.prototype.hasOwnProperty.call(body, "dmOptIn");
+  const hasDmPref = Object.prototype.hasOwnProperty.call(body, "dmPref");
+  const hasXHandle = Object.prototype.hasOwnProperty.call(body, "xHandle");
+  const hasDmSet = Object.prototype.hasOwnProperty.call(body, "onboardingDmSet");
+  const hasDone = Object.prototype.hasOwnProperty.call(body, "onboardingDone");
+
+  // Insert if not exists
   await pool.query(
     `
-    INSERT INTO telegram_users (telegram_user_id, telegram_username, dm_opt_in, dm_pref, x_handle, updated_at)
-    VALUES ($1,$2,$3,$4,$5,NOW())
-    ON CONFLICT (telegram_user_id)
-    DO UPDATE SET
-      telegram_username = EXCLUDED.telegram_username,
-      dm_opt_in = EXCLUDED.dm_opt_in,
-      dm_pref = EXCLUDED.dm_pref,
-      x_handle = EXCLUDED.x_handle,
-      updated_at = NOW()
+    INSERT INTO telegram_users (telegram_user_id, telegram_username, updated_at)
+    VALUES ($1,$2,NOW())
+    ON CONFLICT (telegram_user_id) DO UPDATE
+    SET telegram_username = COALESCE(EXCLUDED.telegram_username, telegram_users.telegram_username),
+        updated_at = NOW()
     `,
-    [telegramUserId, telegramUsername || null, !!dmOptIn, dmPref || "ALL", xHandle || null]
+    [telegramUserId, telegramUsername]
   );
+
+  // Update only provided fields
+  const sets = [];
+  const vals = [];
+  let i = 1;
+
+  // always update username if present
+  if (telegramUsername !== null) {
+    sets.push(`telegram_username=$${++i}`);
+    vals.push(telegramUsername);
+  }
+
+  if (hasDmOptIn) {
+    sets.push(`dm_opt_in=$${++i}`);
+    vals.push(!!body.dmOptIn);
+  }
+  if (hasDmPref) {
+    sets.push(`dm_pref=$${++i}`);
+    vals.push(String(body.dmPref || "ALL"));
+  }
+  if (hasXHandle) {
+    // allow null to clear? we will not clear in bot, but keep safe
+    sets.push(`x_handle=$${++i}`);
+    vals.push(body.xHandle ? String(body.xHandle) : null);
+  }
+  if (hasDmSet) {
+    sets.push(`onboarding_dm_set=$${++i}`);
+    vals.push(!!body.onboardingDmSet);
+  }
+  if (hasDone) {
+    sets.push(`onboarding_done=$${++i}`);
+    vals.push(!!body.onboardingDone);
+  }
+
+  if (sets.length > 0) {
+    await pool.query(
+      `UPDATE telegram_users SET ${sets.join(", ")}, updated_at=NOW() WHERE telegram_user_id=$1`,
+      [telegramUserId, ...vals]
+    );
+  }
 
   res.json({ ok: true });
 });
 
-// ✅ bot reads from VIEW (has is_verified 1/0)
+// ✅ DB is source of truth
 app.get("/tg/users/:telegramUserId", requireBotKey, async (req, res) => {
   const id = Number(req.params.telegramUserId);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid id" });
 
   const r = await pool.query(
-    `SELECT telegram_user_id, telegram_username, dm_opt_in, dm_pref, x_handle, updated_at, is_verified
-     FROM telegram_users_v
-     WHERE telegram_user_id = $1
-     LIMIT 1`,
+    `
+    SELECT telegram_user_id, telegram_username, dm_opt_in, dm_pref, x_handle,
+           onboarding_dm_set, onboarding_done, is_verified,
+           created_at, updated_at
+    FROM telegram_users
+    WHERE telegram_user_id=$1
+    LIMIT 1
+    `,
     [id]
   );
 
@@ -184,12 +319,14 @@ app.post("/tg/groups/upsert", requireBotKey, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ---------------- admin endpoints ---------------- */
+/* ---------------- ADMIN APIs ---------------- */
 
 app.get("/admin/tg/users", requireAdmin, async (_req, res) => {
   const r = await pool.query(`
-    SELECT telegram_user_id, telegram_username, dm_opt_in, dm_pref, x_handle, is_verified, created_at, updated_at
-    FROM telegram_users_v
+    SELECT telegram_user_id, telegram_username, dm_opt_in, dm_pref, x_handle,
+           onboarding_dm_set, onboarding_done, is_verified,
+           created_at, updated_at
+    FROM telegram_users
     ORDER BY updated_at DESC
     LIMIT 500
   `);
@@ -206,8 +343,57 @@ app.get("/admin/tg/groups", requireAdmin, async (_req, res) => {
   res.json(r.rows);
 });
 
+// Giveaways (senin worker için)
+app.get("/admin/giveaways", requireAdmin, async (_req, res) => {
+  const r = await pool.query(`SELECT * FROM giveaways ORDER BY id DESC LIMIT 200`);
+  res.json(r.rows);
+});
+
+app.post("/admin/giveaways", requireAdmin, async (req, res) => {
+  const { title, description, x_account, x_post_url, winners_count, tg_chat_id } = req.body || {};
+  if (!title || !x_account || !x_post_url) return res.status(400).json({ error: "missing fields" });
+
+  const r = await pool.query(
+    `INSERT INTO giveaways (title, description, x_account, x_post_url, winners_count, tg_chat_id, status, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,'DRAFT',NOW())
+     RETURNING *`,
+    [title, description || null, x_account, x_post_url, Number(winners_count || 1), tg_chat_id ? Number(tg_chat_id) : null]
+  );
+  res.json(r.rows[0]);
+});
+
+app.post("/admin/giveaways/:id/tasks", requireAdmin, async (req, res) => {
+  const giveawayId = Number(req.params.id);
+  const { tasks } = req.body || {};
+  if (!Number.isFinite(giveawayId)) return res.status(400).json({ error: "bad id" });
+  if (!Array.isArray(tasks)) return res.status(400).json({ error: "tasks must be array" });
+
+  await pool.query(`DELETE FROM giveaway_tasks WHERE giveaway_id=$1`, [giveawayId]);
+  for (const t of tasks) {
+    await pool.query(
+      `INSERT INTO giveaway_tasks (giveaway_id, type, payload, is_required) VALUES ($1,$2,$3,$4)`,
+      [giveawayId, String(t.type), t.payload || {}, t.is_required !== false]
+    );
+  }
+  res.json({ ok: true });
+});
+
+app.post("/admin/giveaways/:id/status", requireAdmin, async (req, res) => {
+  const giveawayId = Number(req.params.id);
+  const { status } = req.body || {};
+  const allowed = new Set(["DRAFT", "RUNNING", "COMPLETED", "CANCELLED"]);
+  if (!allowed.has(String(status))) return res.status(400).json({ error: "bad status" });
+
+  const r = await pool.query(
+    `UPDATE giveaways SET status=$2, updated_at=NOW() WHERE id=$1 RETURNING *`,
+    [giveawayId, String(status)]
+  );
+  res.json(r.rows[0]);
+});
+
 app.listen(PORT, async () => {
   await ensureAdminUser();
-  await ensureTelegramTablesAndViews();
+  await ensureTelegramTables();
+  await ensureGiveawayTables();
   console.log(`API running on port ${PORT}`);
 });
