@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import { Telegraf, Markup } from "telegraf";
 
-const VERSION = "v1.1.1-full";
+const VERSION = "v1.1.2-updatex-button";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
@@ -17,9 +17,13 @@ const BOT_INTERNAL_KEY = process.env.BOT_INTERNAL_KEY;
 
 if (!API_BASE_URL) console.warn("WARNING: Missing API_BASE_URL");
 if (!BOT_API_KEY) console.warn("WARNING: Missing BOT_API_KEY");
+if (!BOT_INTERNAL_KEY) console.warn("WARNING: Missing BOT_INTERNAL_KEY (broadcast disabled)");
 
 const bot = new Telegraf(TOKEN);
-const state = new Map(); // telegramUserId -> { dmOptIn, dmPref, xHandle }
+
+// cache/state
+// { dmOptIn, dmPref, xHandle, waitingForXUpdate }
+const state = new Map();
 
 function hasBotAuth() {
   return !!(API_BASE_URL && BOT_API_KEY);
@@ -41,7 +45,11 @@ async function getExistingUser(telegramUserId) {
   if (!hasBotAuth()) return null;
   const res = await apiFetch(`/tg/users/${telegramUserId}`, { method: "GET" });
   if (res.status === 404) return null;
-  if (!res.ok) return null;
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    console.error("API lookup failed", res.status, txt);
+    return null;
+  }
   return res.json().catch(() => null);
 }
 
@@ -59,52 +67,87 @@ async function upsertUser(ctx, extra = {}) {
     ...extra,
   };
 
-  state.set(u.id, { dmOptIn: payload.dmOptIn, dmPref: payload.dmPref, xHandle: payload.xHandle });
+  state.set(u.id, {
+    dmOptIn: payload.dmOptIn,
+    dmPref: payload.dmPref,
+    xHandle: payload.xHandle,
+    waitingForXUpdate: st.waitingForXUpdate ?? false,
+  });
 
-  await apiFetch("/tg/users/upsert", {
+  const res = await apiFetch("/tg/users/upsert", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  }).catch(() => {});
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    console.error("API upsert failed", res.status, txt);
+  }
 }
 
-// ✅ Your rule: if tg username + x_handle exist -> verified, NEVER ask again
+// ✅ verified rule: TG username + X handle exist in DB
 function isVerified(dbUser) {
   return !!(dbUser && dbUser.telegram_username && dbUser.x_handle);
 }
 
 function optInKeyboard() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("Yes (All)", "optin_all"), Markup.button.callback("Yes (Important Only)", "optin_important")],
+    [
+      Markup.button.callback("Yes (All)", "optin_all"),
+      Markup.button.callback("Yes (Important Only)", "optin_important"),
+    ],
     [Markup.button.callback("No", "optin_no")],
   ]);
 }
 
+function verifiedKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Update X username", "update_x")],
+  ]);
+}
+
+/* ---------- Commands ---------- */
+
 bot.command("version", async (ctx) => {
-  await ctx.reply(`AirdropsFather Bot `);
+  await ctx.reply(`AirdropsFather Bot ${VERSION}`);
 });
 
-bot.command("update_x", async (ctx) => {
-  await ctx.reply("Send your new X (Twitter) username starting with @ (Example: )");
-  state.set(ctx.from.id, { ...(state.get(ctx.from.id) || {}), waitingForXUpdate: true });
-});
-});
+/* ---------- Start ---------- */
 
 bot.start(async (ctx) => {
-  // Upsert basics first (captures tg username)
+  // Always upsert basics first (captures telegram username)
   await upsertUser(ctx);
 
   const existing = await getExistingUser(ctx.from.id);
+
   if (isVerified(existing)) {
-    await ctx.reply(`✅ You are already verified.\n\nTG: @${existing.telegram_username}\nX: ${existing.x_handle}`);
+    // ✅ already verified: no questions, show update button
+    await ctx.reply(
+      `✅ You are already verified.\n\nTG: @${existing.telegram_username}\nX: ${existing.x_handle}`,
+      verifiedKeyboard()
+    );
     return;
   }
 
+  // not verified -> start flow
   await ctx.reply(
     "Welcome to AirdropsFather.\n\nDo you want to receive giveaway notifications via DM?",
     optInKeyboard()
   );
 });
+
+/* ---------- Update X flow (button) ---------- */
+
+bot.action("update_x", async (ctx) => {
+  await ctx.answerCbQuery();
+  const st = state.get(ctx.from.id) || {};
+  state.set(ctx.from.id, { ...st, waitingForXUpdate: true });
+
+  await ctx.reply("Send your new X (Twitter) username starting with @ (Example: @airdropsfather)");
+});
+
+/* ---------- Opt-in callbacks ---------- */
 
 bot.action("optin_all", async (ctx) => {
   await ctx.answerCbQuery();
@@ -127,17 +170,25 @@ bot.action("optin_no", async (ctx) => {
   await ctx.reply("Okay. What is your X (Twitter) username? (Example: @airdropsfather)");
 });
 
+/* ---------- Text handler ---------- */
+
 bot.on("text", async (ctx) => {
   const msg = ctx.message.text.trim();
-
   const st = state.get(ctx.from.id) || {};
-  if (st.waitingForXUpdate && msg.startsWith("@") && msg.length >= 3) {
+
+  // Update X flow
+  if (st.waitingForXUpdate) {
+    if (!msg.startsWith("@") || msg.length < 3) {
+      await ctx.reply("Invalid format. Send your X username starting with @ (Example: @airdropsfather)");
+      return;
+    }
     state.set(ctx.from.id, { ...st, waitingForXUpdate: false, xHandle: msg });
     await upsertUser(ctx, { xHandle: msg });
-    await ctx.reply(`✅ Updated X username: `);
+    await ctx.reply(`✅ Updated X username: ${msg}`);
     return;
   }
 
+  // Normal verification: accept @handle when not verified yet
   const existing = await getExistingUser(ctx.from.id);
   if (isVerified(existing)) return;
 
@@ -147,14 +198,18 @@ bot.on("text", async (ctx) => {
 
     const after = await getExistingUser(ctx.from.id);
     if (isVerified(after)) {
-      await ctx.reply(`✅ Verified.\n\nTG: @${after.telegram_username}\nX: ${after.x_handle}`);
+      await ctx.reply(
+        `✅ Verified.\n\nTG: @${after.telegram_username}\nX: ${after.x_handle}`,
+        verifiedKeyboard()
+      );
     } else {
       await ctx.reply(`Saved ✅\nX username: ${msg}`);
     }
   }
 });
 
-// internal broadcast endpoint
+/* ---------- Internal broadcast endpoint ---------- */
+
 const app = express();
 app.use(express.json());
 
@@ -170,14 +225,17 @@ app.post("/internal/broadcast", async (req, res) => {
   const results = { ok: 0, fail: 0 };
   for (const chatId of recipients) {
     try {
-      await bot.telegram.sendMessage(chatId, message);
+      await bot.telegram.sendMessage(chatId, message, { disable_web_page_preview: false });
       results.ok += 1;
-    } catch {
+    } catch (e) {
       results.fail += 1;
+      console.error("broadcast failed for", chatId, e?.message || e);
     }
   }
   res.json(results);
 });
+
+/* ---------- Telegram webhook ---------- */
 
 app.post(`/telegram/webhook/${WEBHOOK_SECRET}`, (req, res) => {
   bot.handleUpdate(req.body, res);
