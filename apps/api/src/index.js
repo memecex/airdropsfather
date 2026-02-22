@@ -124,6 +124,25 @@ async function ensureTelegramTables() {
 
 async function ensureGiveawayTables() {
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS task_catalog (
+      code TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      description TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    INSERT INTO task_catalog (code, label, description)
+    VALUES
+      (\x27LIKE\x27, \x27Like the post\x27, \x27User must like the X post\x27),
+      (\x27RT\x27, \x27Retweet the post\x27, \x27User must retweet the X post\x27),
+      (\x27COMMENT\x27, \x27Comment on the post\x27, \x27User must comment/reply\x27),
+      (\x27JOIN_TG\x27, \x27Join Telegram group\x27, \x27User must be a member of selected Telegram group\x27)
+    ON CONFLICT (code) DO NOTHING;
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS giveaways (
       id SERIAL PRIMARY KEY,
       title TEXT NOT NULL,
@@ -389,6 +408,11 @@ app.post("/admin/giveaways/:id/status", requireAdmin, async (req, res) => {
     [giveawayId, String(status)]
   );
   res.json(r.rows[0]);
+});
+
+app.get("/admin/task-catalog", requireAdmin, async (_req, res) => {
+  const r = await pool.query("SELECT code, label, description FROM task_catalog ORDER BY code ASC");
+  res.json(r.rows);
 });
 
 app.listen(PORT, async () => {
