@@ -15,21 +15,24 @@ const BOT_INTERNAL_KEY = process.env.BOT_INTERNAL_KEY;
 
 if (!API_BASE_URL) console.warn("WARNING: Missing API_BASE_URL");
 if (!BOT_API_KEY) console.warn("WARNING: Missing BOT_API_KEY");
+if (!BOT_INTERNAL_KEY) console.warn("WARNING: Missing BOT_INTERNAL_KEY (broadcast disabled)");
 
 const bot = new Telegraf(TOKEN);
+
+// In-memory state (temporary). DB is the source of truth.
 const state = new Map(); // telegramUserId -> { dmOptIn, dmPref, xHandle }
 
 function hasBotAuth() {
   return !!(API_BASE_URL && BOT_API_KEY);
 }
 
-async function apiFetch(path, init) {
+async function apiFetch(path, init = {}) {
   if (!API_BASE_URL) throw new Error("Missing API_BASE_URL");
   if (!BOT_API_KEY) throw new Error("Missing BOT_API_KEY");
   return fetch(`${API_BASE_URL}${path}`, {
     ...init,
     headers: {
-      ...(init?.headers || {}),
+      ...(init.headers || {}),
       "x-bot-key": BOT_API_KEY,
     },
   });
@@ -37,7 +40,7 @@ async function apiFetch(path, init) {
 
 async function upsertUser(ctx, extra = {}) {
   const u = ctx.from;
-  if (!u) return;
+  if (!u || !hasBotAuth()) return;
 
   const st = state.get(u.id) || {};
   const payload = {
@@ -49,13 +52,12 @@ async function upsertUser(ctx, extra = {}) {
     ...extra,
   };
 
+  // update local cache
   state.set(u.id, {
     dmOptIn: payload.dmOptIn,
     dmPref: payload.dmPref,
     xHandle: payload.xHandle,
   });
-
-  if (!hasBotAuth()) return;
 
   const res = await apiFetch("/tg/users/upsert", {
     method: "POST",
@@ -70,19 +72,27 @@ async function upsertUser(ctx, extra = {}) {
 }
 
 async function getExistingUser(telegramUserId) {
-  if (!hasBotAuth()) return { status: "no_auth", user: null };
+  if (!hasBotAuth()) return null;
 
   const res = await apiFetch(`/tg/users/${telegramUserId}`, { method: "GET" });
-  if (res.status === 404) return { status: "not_found", user: null };
+  if (res.status === 404) return null;
 
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
     console.error("API lookup failed", res.status, txt);
-    return { status: `error_${res.status}`, user: null };
+    return null;
   }
 
-  const user = await res.json().catch(() => null);
-  return { status: "ok", user };
+  return res.json().catch(() => null);
+}
+
+/**
+ * Verified definition (as you requested):
+ * If DB has BOTH telegram_username AND x_handle -> DO NOT ASK ANY QUESTIONS.
+ */
+function isAlreadyVerified(dbUser) {
+  if (!dbUser) return false;
+  return !!(dbUser.telegram_username && dbUser.x_handle);
 }
 
 function groupOnboardingMessage() {
@@ -99,40 +109,50 @@ function verifyDeepLink(chatId) {
   return `https://t.me/${bot.botInfo?.username}?start=verify_${chatId}`;
 }
 
+function optInKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Yes (All)", "optin_all"), Markup.button.callback("Yes (Important Only)", "optin_important")],
+    [Markup.button.callback("No", "optin_no")],
+  ]);
+}
+
+/* ------------------ /start ------------------ */
+
 bot.start(async (ctx) => {
   const text = ctx.message?.text || "";
   const payload = (text.split(" ")[1] || "");
 
-  // Always store basics (username)
+  // always upsert basics (captures telegram username if present)
   await upsertUser(ctx);
 
-  if (payload.startsWith("verify_")) {
-    const { status, user } = await getExistingUser(ctx.from.id);
+  // check DB for existing verification
+  const existing = await getExistingUser(ctx.from.id);
 
-    // ✅ VERIFIED RULE: if x_handle exists in DB, do NOT ask anything again.
-    if (user && user.x_handle) {
-      await ctx.reply(`✅ You are already verified.\n\nX username: ${user.x_handle}`);
-      return;
-    }
-
-    // If lookup failed, we still continue with flow, but we log the status.
-    if (status !== "ok" && status !== "not_found") {
-      console.log("verify lookup status:", status);
-    }
-
-    // If user not verified yet -> ask opt-in once, then ask X handle
+  // ✅ IMPORTANT: even when payload is empty, if verified -> never ask again
+  if (isAlreadyVerified(existing)) {
     await ctx.reply(
-      "Welcome to AirdropsFather.\n\nDo you want to receive giveaway notifications via DM?",
-      Markup.inlineKeyboard([
-        [Markup.button.callback("Yes (All)", "optin_all"), Markup.button.callback("Yes (Important Only)", "optin_important")],
-        [Markup.button.callback("No", "optin_no")],
-      ])
+      `✅ You are already verified.\n\nTG: @${existing.telegram_username}\nX: ${existing.x_handle}`
     );
     return;
   }
 
-  await ctx.reply("AirdropsFather bot is running.");
+  // If start was from verify deep link -> run onboarding only if not verified yet
+  if (payload.startsWith("verify_")) {
+    await ctx.reply(
+      "Welcome to AirdropsFather.\n\nDo you want to receive giveaway notifications via DM?",
+      optInKeyboard()
+    );
+    return;
+  }
+
+  // Normal /start (no payload) for not-yet-verified users:
+  await ctx.reply(
+    "Welcome to AirdropsFather.\n\nTo verify, choose your DM preference first:",
+    optInKeyboard()
+  );
 });
+
+/* ------------------ opt-in callbacks ------------------ */
 
 bot.action("optin_all", async (ctx) => {
   await ctx.answerCbQuery();
@@ -155,14 +175,33 @@ bot.action("optin_no", async (ctx) => {
   await ctx.reply("Okay. What is your X (Twitter) username? (Example: @airdropsfather)");
 });
 
+/* ------------------ X handle capture ------------------ */
+
 bot.on("text", async (ctx) => {
   const msg = ctx.message.text.trim();
+
+  // If already verified, ignore any re-verify prompts
+  const existing = await getExistingUser(ctx.from.id);
+  if (isAlreadyVerified(existing)) {
+    // optional: allow update by sending /update later (we'll add later)
+    return;
+  }
+
   if (msg.startsWith("@") && msg.length >= 3) {
     state.set(ctx.from.id, { ...(state.get(ctx.from.id) || {}), xHandle: msg });
     await upsertUser(ctx, { xHandle: msg });
-    await ctx.reply(`Saved ✅\nX username: ${msg}\n\nYou can now participate in giveaways.`);
+
+    // after saving, re-check DB to confirm it's now verified
+    const after = await getExistingUser(ctx.from.id);
+    if (isAlreadyVerified(after)) {
+      await ctx.reply(`Saved ✅\n\nYou're now verified.\nTG: @${after.telegram_username}\nX: ${after.x_handle}`);
+    } else {
+      await ctx.reply(`Saved ✅\nX username: ${msg}`);
+    }
   }
 });
+
+/* ------------------ group onboarding ------------------ */
 
 bot.on("my_chat_member", async (ctx) => {
   const chat = ctx.chat;
@@ -191,7 +230,8 @@ bot.on("my_chat_member", async (ctx) => {
   }
 });
 
-// internal broadcast endpoint (API calls this)
+/* ------------------ internal broadcast endpoint ------------------ */
+
 const app = express();
 app.use(express.json());
 
@@ -216,6 +256,8 @@ app.post("/internal/broadcast", async (req, res) => {
   }
   res.json(results);
 });
+
+/* ------------------ telegram webhook ------------------ */
 
 app.post(`/telegram/webhook/${WEBHOOK_SECRET}`, (req, res) => {
   bot.handleUpdate(req.body, res);
