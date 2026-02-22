@@ -2,13 +2,14 @@ export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE_URL ||
   "https://api-production-0b1bd.up.railway.app";
 
-function getToken() {
+export function getAdminToken() {
   if (typeof window === "undefined") return null;
   return localStorage.getItem("admin_token");
 }
 
-async function apiFetch(path: string, init: RequestInit = {}) {
-  const token = getToken();
+// ✅ Backward-compatible export (some pages import adminFetch)
+export async function adminFetch(path: string, init: RequestInit = {}) {
+  const token = getAdminToken();
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers: {
@@ -30,9 +31,13 @@ async function apiFetch(path: string, init: RequestInit = {}) {
 }
 
 export async function adminGetUsers() {
-  return apiFetch("/admin/tg/users", { method: "GET" });
+  return adminFetch("/admin/tg/users", { method: "GET" });
 }
 
 export async function adminGetGroups() {
-  return apiFetch("/admin/tg/groups", { method: "GET" });
+  return adminFetch("/admin/tg/groups", { method: "GET" });
+}
+
+export async function adminGetGiveaways() {
+  return adminFetch("/admin/giveaways", { method: "GET" });
 }
