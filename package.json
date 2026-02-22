@@ -1,0 +1,10 @@
+{
+  "name": "airdropsfather",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "packageManager": "npm@11",
+  "scripts": {
+    "bot": "npm --workspace apps/bot run start",
+    "bot:dev": "npm --workspace apps/bot run dev"
+  }
+}
