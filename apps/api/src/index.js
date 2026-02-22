@@ -16,9 +16,9 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "devsecret";
 const DATABASE_URL = process.env.DATABASE_URL;
 
-const BOT_API_KEY = process.env.BOT_API_KEY;
-const BOT_INTERNAL_KEY = process.env.BOT_INTERNAL_KEY;
-const BOT_SERVICE_URL = process.env.BOT_SERVICE_URL;
+const BOT_API_KEY = process.env.BOT_API_KEY;            // bot -> api
+const BOT_INTERNAL_KEY = process.env.BOT_INTERNAL_KEY;  // api -> bot (broadcast)
+const BOT_SERVICE_URL = process.env.BOT_SERVICE_URL;    // bot public url for internal calls
 
 if (!DATABASE_URL) {
   console.error("Missing DATABASE_URL");
@@ -102,7 +102,6 @@ app.get("/", (_req, res) => res.json({ status: "API running" }));
 
 app.post("/auth/login", async (req, res) => {
   const { username, password } = req.body || {};
-
   const result = await pool.query("SELECT * FROM admin_users WHERE username = $1", [username]);
   if (result.rows.length === 0) return res.status(401).json({ error: "Invalid credentials" });
 
@@ -115,7 +114,7 @@ app.post("/auth/login", async (req, res) => {
 });
 
 /**
- * Bot -> API (protected by BOT_API_KEY)
+ * Bot -> API (protected)
  */
 app.post("/tg/users/upsert", requireBotKey, async (req, res) => {
   const { telegramUserId, telegramUsername, dmOptIn, dmPref, xHandle } = req.body || {};
@@ -139,6 +138,10 @@ app.post("/tg/users/upsert", requireBotKey, async (req, res) => {
   res.json({ ok: true });
 });
 
+/**
+ * ✅ REQUIRED FOR "don't ask again":
+ * Bot reads a single user from DB using BOT_API_KEY.
+ */
 app.get("/tg/users/:telegramUserId", requireBotKey, async (req, res) => {
   const id = Number(req.params.telegramUserId);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "invalid id" });
@@ -173,7 +176,7 @@ app.post("/tg/groups/upsert", requireBotKey, async (req, res) => {
 });
 
 /**
- * Admin endpoints
+ * Admin (panel) endpoints
  */
 app.get("/admin/tg/users", requireAdmin, async (_req, res) => {
   const r = await pool.query(`
