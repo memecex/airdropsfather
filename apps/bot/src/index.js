@@ -6,19 +6,22 @@ const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 
 const WEBHOOK_SECRET = process.env.BOT_WEBHOOK_SECRET || "devsecret";
-const BOT_PUBLIC_URL = process.env.BOT_PUBLIC_URL; // e.g. https://airdropsfather.up.railway.app
+const BOT_PUBLIC_URL = process.env.BOT_PUBLIC_URL;
 const PORT = process.env.PORT || 3000;
 
-const API_BASE_URL = process.env.API_BASE_URL; // e.g. https://api-production-xxxx.up.railway.app
+const API_BASE_URL = process.env.API_BASE_URL;
 const BOT_API_KEY = process.env.BOT_API_KEY;
+
+const BOT_INTERNAL_KEY = process.env.BOT_INTERNAL_KEY; // must match API
+if (!BOT_INTERNAL_KEY) console.warn("WARNING: Missing BOT_INTERNAL_KEY (broadcast endpoint disabled).");
 
 if (!API_BASE_URL) console.warn("WARNING: Missing API_BASE_URL (DB sync will fail).");
 if (!BOT_API_KEY) console.warn("WARNING: Missing BOT_API_KEY (DB sync will fail).");
 
 const bot = new Telegraf(TOKEN);
 
-// In-memory state (temporary). We'll move to DB later.
-const state = new Map(); // telegramUserId -> { dmOptIn, dmPref }
+// Temporary in-memory (later move to DB)
+const state = new Map(); // telegramUserId -> { dmOptIn, dmPref, xHandle }
 
 async function postJSON(path, body) {
   if (!API_BASE_URL || !BOT_API_KEY) return;
@@ -65,7 +68,6 @@ async function upsertUser(ctx, extra = {}) {
     ...extra,
   };
 
-  // keep local state synced
   state.set(u.id, {
     ...st,
     dmOptIn: payload.dmOptIn,
@@ -81,7 +83,6 @@ bot.start(async (ctx) => {
   const parts = text.split(" ");
   const payload = parts[1] || "";
 
-  // Always upsert user basics (username etc.)
   await upsertUser(ctx);
 
   if (payload.startsWith("verify_")) {
@@ -124,13 +125,11 @@ bot.action("optin_no", async (ctx) => {
 
 bot.on("text", async (ctx) => {
   const msg = ctx.message.text.trim();
-  // Accept @handle and confirm
   if (msg.startsWith("@") && msg.length >= 3) {
     const st = state.get(ctx.from.id) || {};
     state.set(ctx.from.id, { ...st, xHandle: msg });
     await upsertUser(ctx);
     await ctx.reply(`Saved ✅\nX username: ${msg}\n\nYou can now participate in giveaways.`);
-    return;
   }
 });
 
@@ -139,8 +138,6 @@ bot.on("my_chat_member", async (ctx) => {
   if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) return;
 
   const newStatus = ctx.update.my_chat_member?.new_chat_member?.status;
-
-  // When bot becomes member/admin in a group: save group + send onboarding
   if (newStatus === "member" || newStatus === "administrator") {
     try {
       await postJSON("/tg/groups/upsert", {
@@ -162,10 +159,32 @@ bot.on("my_chat_member", async (ctx) => {
 const app = express();
 app.use(express.json());
 
-// health
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
-// webhook route
+// internal broadcast endpoint (API calls this)
+app.post("/internal/broadcast", async (req, res) => {
+  const key = req.headers["x-internal-key"];
+  if (!BOT_INTERNAL_KEY || key !== BOT_INTERNAL_KEY) return res.status(401).json({ error: "Unauthorized" });
+
+  const { message, recipients } = req.body || {};
+  if (!message || !Array.isArray(recipients)) return res.status(400).json({ error: "message + recipients required" });
+
+  const results = { ok: 0, fail: 0 };
+
+  for (const chatId of recipients) {
+    try {
+      await bot.telegram.sendMessage(chatId, message, { disable_web_page_preview: false });
+      results.ok += 1;
+    } catch (e) {
+      results.fail += 1;
+      console.error("broadcast failed for", chatId, e?.message || e);
+    }
+  }
+
+  res.json(results);
+});
+
+// webhook
 app.post(`/telegram/webhook/${WEBHOOK_SECRET}`, (req, res) => {
   bot.handleUpdate(req.body, res);
 });
