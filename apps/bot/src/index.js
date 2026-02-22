@@ -15,18 +15,24 @@ const BOT_INTERNAL_KEY = process.env.BOT_INTERNAL_KEY;
 
 if (!API_BASE_URL) console.warn("WARNING: Missing API_BASE_URL");
 if (!BOT_API_KEY) console.warn("WARNING: Missing BOT_API_KEY");
-if (!BOT_INTERNAL_KEY) console.warn("WARNING: Missing BOT_INTERNAL_KEY (broadcast disabled)");
 
 const bot = new Telegraf(TOKEN);
 const state = new Map(); // telegramUserId -> { dmOptIn, dmPref, xHandle }
 
+function hasBotAuth() {
+  return !!(API_BASE_URL && BOT_API_KEY);
+}
+
 async function apiFetch(path, init) {
   if (!API_BASE_URL) throw new Error("Missing API_BASE_URL");
-  const headers = {
-    ...(init?.headers || {}),
-    "x-bot-key": BOT_API_KEY || "",
-  };
-  return fetch(`${API_BASE_URL}${path}`, { ...init, headers });
+  if (!BOT_API_KEY) throw new Error("Missing BOT_API_KEY");
+  return fetch(`${API_BASE_URL}${path}`, {
+    ...init,
+    headers: {
+      ...(init?.headers || {}),
+      "x-bot-key": BOT_API_KEY,
+    },
+  });
 }
 
 async function upsertUser(ctx, extra = {}) {
@@ -49,7 +55,7 @@ async function upsertUser(ctx, extra = {}) {
     xHandle: payload.xHandle,
   });
 
-  if (!API_BASE_URL || !BOT_API_KEY) return;
+  if (!hasBotAuth()) return;
 
   const res = await apiFetch("/tg/users/upsert", {
     method: "POST",
@@ -64,19 +70,26 @@ async function upsertUser(ctx, extra = {}) {
 }
 
 async function getExistingUser(telegramUserId) {
-  if (!API_BASE_URL || !BOT_API_KEY) return null;
+  if (!hasBotAuth()) return { status: "no_auth", user: null };
+
   const res = await apiFetch(`/tg/users/${telegramUserId}`, { method: "GET" });
-  if (res.status === 404) return null;
-  if (!res.ok) return null;
-  return res.json();
+  if (res.status === 404) return { status: "not_found", user: null };
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    console.error("API lookup failed", res.status, txt);
+    return { status: `error_${res.status}`, user: null };
+  }
+
+  const user = await res.json().catch(() => null);
+  return { status: "ok", user };
 }
 
 function groupOnboardingMessage() {
   return [
     "✅ *AirdropsFather Verification*",
     "",
-    "To receive giveaway notifications and verify your participation, tap the button below.",
-    "You will be asked for your X (Twitter) username.",
+    "Tap the button below to verify and receive giveaway notifications.",
     "",
     "_Note: The bot can DM you only after you start a chat._",
   ].join("\n");
@@ -90,18 +103,24 @@ bot.start(async (ctx) => {
   const text = ctx.message?.text || "";
   const payload = (text.split(" ")[1] || "");
 
-  // store basics (username) as soon as they start chat
+  // Always store basics (username)
   await upsertUser(ctx);
 
   if (payload.startsWith("verify_")) {
-    const existing = await getExistingUser(ctx.from.id);
+    const { status, user } = await getExistingUser(ctx.from.id);
 
-    // already verified if opted-in AND has x handle
-    if (existing && existing.dm_opt_in === true && existing.x_handle) {
-      await ctx.reply(`✅ You are already verified.\n\nX username: ${existing.x_handle}`);
+    // ✅ VERIFIED RULE: if x_handle exists in DB, do NOT ask anything again.
+    if (user && user.x_handle) {
+      await ctx.reply(`✅ You are already verified.\n\nX username: ${user.x_handle}`);
       return;
     }
 
+    // If lookup failed, we still continue with flow, but we log the status.
+    if (status !== "ok" && status !== "not_found") {
+      console.log("verify lookup status:", status);
+    }
+
+    // If user not verified yet -> ask opt-in once, then ask X handle
     await ctx.reply(
       "Welcome to AirdropsFather.\n\nDo you want to receive giveaway notifications via DM?",
       Markup.inlineKeyboard([
@@ -152,7 +171,7 @@ bot.on("my_chat_member", async (ctx) => {
   const newStatus = ctx.update.my_chat_member?.new_chat_member?.status;
   if (newStatus === "member" || newStatus === "administrator") {
     try {
-      if (API_BASE_URL && BOT_API_KEY) {
+      if (hasBotAuth()) {
         const res = await apiFetch("/tg/groups/upsert", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
