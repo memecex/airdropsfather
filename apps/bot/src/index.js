@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import { Telegraf, Markup } from "telegraf";
 
-const VERSION = "v1.3.0-onboarding-sql";
+const VERSION = "v1.3.1-groups-membership";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
@@ -52,6 +52,18 @@ async function upsertUser(telegramUserId, payload) {
   }).catch(() => {});
 }
 
+async function upsertGroup(chat) {
+  if (!chat || !hasBotAuth()) return;
+  if (chat.type !== "group" && chat.type !== "supergroup") return;
+  const telegramChatId = chat.id;
+  const title = chat.title || null;
+  await apiFetch("/tg/groups/upsert", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ telegramChatId, title }),
+  }).catch(() => {});
+}
+
 const optInKeyboard = () =>
   Markup.inlineKeyboard([
     [Markup.button.callback("Yes (All)", "optin_all"), Markup.button.callback("Yes (Important Only)", "optin_important")],
@@ -65,6 +77,16 @@ bot.command("xchange", async (ctx) => {
   await ctx.reply("Send your new X (Twitter) username starting with @ (Example: @airdropsfather)");
 });
 
+bot.command("groupid", async (ctx) => {
+  const chat = ctx.chat;
+  if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) {
+    await ctx.reply("Use /groupid inside the target group.");
+    return;
+  }
+  await upsertGroup(chat);
+  await ctx.reply(`✅ Group saved.\nTitle: ${chat.title || "(no title)"}\nChat ID: ${chat.id}`);
+});
+
 // Auto-register groups when bot membership changes
 bot.on("my_chat_member", async (ctx) => {
   try {
@@ -72,11 +94,11 @@ bot.on("my_chat_member", async (ctx) => {
   } catch {}
 });
 
-// Also register when bot is added as a new member (some groups send this instead)
+// Also register when bot is added as a new member
 bot.on("new_chat_members", async (ctx) => {
   try {
     const me = await bot.telegram.getMe();
-    const added = (ctx.message?.new_chat_members || []).some(m => m.id === me.id);
+    const added = (ctx.message?.new_chat_members || []).some((m) => m.id === me.id);
     if (added) await upsertGroup(ctx.chat);
   } catch {}
 });
@@ -90,7 +112,6 @@ bot.start(async (ctx) => {
 
   const dbu = await getDbUser(u.id);
 
-  // ✅ If onboarding is complete, NEVER ask questions again.
   if (dbu && dbu.onboarding_done === true) {
     const tg = dbu.telegram_username ? `@${dbu.telegram_username}` : "(no tg)";
     const x = dbu.x_handle || "(no x)";
@@ -100,14 +121,12 @@ bot.start(async (ctx) => {
     return;
   }
 
-  // If DM choice already set, do not ask again. Only ask for missing X.
   if (dbu && dbu.onboarding_dm_set === true) {
     if (!dbu.x_handle) {
       await ctx.reply("What is your X (Twitter) username? (Example: @airdropsfather)");
       return;
     }
 
-    // If x exists but onboarding_done false (legacy), finalize
     await upsertUser(u.id, { onboardingDone: true });
     await ctx.reply(
       `✅ You are already verified.\n\nTG: @${dbu.telegram_username}\nX: ${dbu.x_handle}\n\nTo change your X username: /xchange`
@@ -115,7 +134,6 @@ bot.start(async (ctx) => {
     return;
   }
 
-  // First time: ask DM opt-in ONLY once
   await ctx.reply("Welcome to AirdropsFather.\n\nDo you want to receive giveaway notifications via DM?", optInKeyboard());
 });
 
@@ -144,7 +162,6 @@ bot.on("text", async (ctx) => {
   const id = ctx.from.id;
   const msg = ctx.message.text.trim();
 
-  // /xchange flow
   const st = state.get(id) || {};
   if (st.waitingForX) {
     if (!msg.startsWith("@") || msg.length < 3) {
@@ -160,16 +177,13 @@ bot.on("text", async (ctx) => {
     return;
   }
 
-  // If onboarding already done, ignore text (no re-onboarding)
   const dbu = await getDbUser(id);
   if (dbu?.onboarding_done === true) return;
 
-  // Accept X handle when asked
   if (msg.startsWith("@") && msg.length >= 3) {
     await upsertUser(id, { xHandle: msg });
 
     const after = await getDbUser(id);
-    // finalize onboarding if dm choice done and x exists
     if (after?.onboarding_dm_set === true && after?.x_handle) {
       await upsertUser(id, { onboardingDone: true });
       await ctx.reply(
@@ -181,7 +195,7 @@ bot.on("text", async (ctx) => {
   }
 });
 
-/* internal broadcast (unchanged) */
+/* internal server */
 const app = express();
 app.use(express.json());
 
@@ -204,6 +218,24 @@ app.post("/internal/broadcast", async (req, res) => {
     }
   }
   res.json(results);
+});
+
+// membership check for JOIN_TG task validation
+app.post("/internal/check_member", async (req, res) => {
+  const key = req.headers["x-internal-key"];
+  if (!BOT_INTERNAL_KEY || key !== BOT_INTERNAL_KEY) return res.status(401).json({ error: "Unauthorized" });
+
+  const { chatId, userId } = req.body || {};
+  if (!chatId || !userId) return res.status(400).json({ error: "chatId + userId required" });
+
+  try {
+    const m = await bot.telegram.getChatMember(Number(chatId), Number(userId));
+    const status = m?.status;
+    const isMember = status && status !== "left" && status !== "kicked";
+    return res.json({ ok: true, status, isMember });
+  } catch (e) {
+    return res.json({ ok: false, error: String(e?.message || e) });
+  }
 });
 
 app.post(`/telegram/webhook/${WEBHOOK_SECRET}`, (req, res) => {
