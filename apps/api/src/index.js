@@ -415,6 +415,14 @@ app.get("/admin/task-catalog", requireAdmin, async (_req, res) => {
   res.json(r.rows);
 });
 
+app.get("/admin/stats", requireAdmin, async (_req, res) => {
+  const u = await pool.query("SELECT COUNT(*)::int AS c FROM telegram_users");
+  const g = await pool.query("SELECT COUNT(*)::int AS c FROM tg_groups");
+  const w = await pool.query("SELECT COUNT(*)::int AS c FROM giveaways");
+
+  res.json({ users: u.rows[0].c, groups: g.rows[0].c, giveaways: w.rows[0].c });
+});
+
 app.listen(PORT, async () => {
   await ensureAdminUser();
   await ensureTelegramTables();
