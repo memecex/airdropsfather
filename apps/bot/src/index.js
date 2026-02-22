@@ -81,7 +81,13 @@ function optInKeyboard() {
 }
 
 bot.command("version", async (ctx) => {
-  await ctx.reply(`AirdropsFather Bot ${VERSION}`);
+  await ctx.reply(`AirdropsFather Bot `);
+});
+
+bot.command("update_x", async (ctx) => {
+  await ctx.reply("Send your new X (Twitter) username starting with @ (Example: )");
+  state.set(ctx.from.id, { ...(state.get(ctx.from.id) || {}), waitingForXUpdate: true });
+});
 });
 
 bot.start(async (ctx) => {
@@ -123,6 +129,14 @@ bot.action("optin_no", async (ctx) => {
 
 bot.on("text", async (ctx) => {
   const msg = ctx.message.text.trim();
+
+  const st = state.get(ctx.from.id) || {};
+  if (st.waitingForXUpdate && msg.startsWith("@") && msg.length >= 3) {
+    state.set(ctx.from.id, { ...st, waitingForXUpdate: false, xHandle: msg });
+    await upsertUser(ctx, { xHandle: msg });
+    await ctx.reply(`✅ Updated X username: `);
+    return;
+  }
 
   const existing = await getExistingUser(ctx.from.id);
   if (isVerified(existing)) return;
