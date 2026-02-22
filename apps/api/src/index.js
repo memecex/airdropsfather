@@ -8,28 +8,25 @@ import pkg from "pg";
 const { Pool } = pkg;
 
 const app = express();
-
-/**
- * CORS:
- * - We do NOT use cookies here, token is stored in localStorage on admin.
- * - So we do wildcard origin and DO NOT set credentials=true.
- */
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+
 const JWT_SECRET = process.env.JWT_SECRET || "devsecret";
 const DATABASE_URL = process.env.DATABASE_URL;
 
 const BOT_API_KEY = process.env.BOT_API_KEY;
-if (!BOT_API_KEY) {
-  console.warn("WARNING: Missing BOT_API_KEY (bot calls will be rejected).");
-}
+const BOT_INTERNAL_KEY = process.env.BOT_INTERNAL_KEY; // used to call bot internal endpoint
+const BOT_SERVICE_URL = process.env.BOT_SERVICE_URL;   // https://airdropsfather.up.railway.app
 
 if (!DATABASE_URL) {
   console.error("Missing DATABASE_URL");
   process.exit(1);
 }
+if (!BOT_API_KEY) console.warn("WARNING: Missing BOT_API_KEY (bot upsert calls will be rejected).");
+if (!BOT_INTERNAL_KEY) console.warn("WARNING: Missing BOT_INTERNAL_KEY (broadcast will be disabled).");
+if (!BOT_SERVICE_URL) console.warn("WARNING: Missing BOT_SERVICE_URL (broadcast will be disabled).");
 
 const pool = new Pool({ connectionString: DATABASE_URL });
 
@@ -45,11 +42,7 @@ async function ensureAdminUser() {
     );
   `);
 
-  const res = await pool.query(
-    "SELECT * FROM admin_users WHERE username = $1",
-    ["admin"]
-  );
-
+  const res = await pool.query("SELECT * FROM admin_users WHERE username = $1", ["admin"]);
   if (res.rows.length === 0) {
     const hash = await bcrypt.hash("123123", 10);
     await pool.query(
@@ -88,60 +81,46 @@ async function ensureTelegramTables() {
 
 function requireBotKey(req, res, next) {
   const key = req.headers["x-bot-key"];
-  if (!BOT_API_KEY || key !== BOT_API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  if (!BOT_API_KEY || key !== BOT_API_KEY) return res.status(401).json({ error: "Unauthorized" });
   next();
 }
 
-app.get("/", (_req, res) => {
-  res.json({ status: "API running" });
-});
+function requireAdmin(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Missing token" });
+
+  try {
+    req.admin = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+app.get("/", (_req, res) => res.json({ status: "API running" }));
 
 app.post("/auth/login", async (req, res) => {
   const { username, password } = req.body || {};
 
-  const result = await pool.query(
-    "SELECT * FROM admin_users WHERE username = $1",
-    [username]
-  );
-
-  if (result.rows.length === 0) {
-    return res.status(401).json({ error: "Invalid credentials" });
-  }
+  const result = await pool.query("SELECT * FROM admin_users WHERE username = $1", [username]);
+  if (result.rows.length === 0) return res.status(401).json({ error: "Invalid credentials" });
 
   const user = result.rows[0];
   const match = await bcrypt.compare(password, user.password_hash);
+  if (!match) return res.status(401).json({ error: "Invalid credentials" });
 
-  if (!match) {
-    return res.status(401).json({ error: "Invalid credentials" });
-  }
+  const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: "7d" });
 
-  const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, {
-    expiresIn: "7d",
-  });
-
-  res.json({
-    token,
-    mustChangePassword: user.must_change_password,
-  });
+  res.json({ token, mustChangePassword: user.must_change_password });
 });
 
 /**
- * Bot-protected endpoints
+ * Bot-protected endpoints (bot -> API)
  */
 app.post("/tg/users/upsert", requireBotKey, async (req, res) => {
-  const {
-    telegramUserId,
-    telegramUsername,
-    dmOptIn,
-    dmPref,
-    xHandle
-  } = req.body || {};
-
-  if (!telegramUserId) {
-    return res.status(400).json({ error: "telegramUserId required" });
-  }
+  const { telegramUserId, telegramUsername, dmOptIn, dmPref, xHandle } = req.body || {};
+  if (!telegramUserId) return res.status(400).json({ error: "telegramUserId required" });
 
   await pool.query(
     `
@@ -155,13 +134,7 @@ app.post("/tg/users/upsert", requireBotKey, async (req, res) => {
       x_handle = EXCLUDED.x_handle,
       updated_at = NOW()
     `,
-    [
-      telegramUserId,
-      telegramUsername || null,
-      !!dmOptIn,
-      (dmPref || "ALL"),
-      xHandle || null
-    ]
+    [telegramUserId, telegramUsername || null, !!dmOptIn, dmPref || "ALL", xHandle || null]
   );
 
   res.json({ ok: true });
@@ -169,9 +142,7 @@ app.post("/tg/users/upsert", requireBotKey, async (req, res) => {
 
 app.post("/tg/groups/upsert", requireBotKey, async (req, res) => {
   const { telegramChatId, title } = req.body || {};
-  if (!telegramChatId) {
-    return res.status(400).json({ error: "telegramChatId required" });
-  }
+  if (!telegramChatId) return res.status(400).json({ error: "telegramChatId required" });
 
   await pool.query(
     `
@@ -184,6 +155,82 @@ app.post("/tg/groups/upsert", requireBotKey, async (req, res) => {
   );
 
   res.json({ ok: true });
+});
+
+/**
+ * Admin endpoints (admin panel -> API)
+ */
+app.get("/admin/tg/users", requireAdmin, async (req, res) => {
+  const r = await pool.query(`
+    SELECT telegram_user_id, telegram_username, dm_opt_in, dm_pref, x_handle, created_at, updated_at
+    FROM telegram_users
+    ORDER BY updated_at DESC
+    LIMIT 500
+  `);
+  res.json(r.rows);
+});
+
+app.get("/admin/tg/groups", requireAdmin, async (req, res) => {
+  const r = await pool.query(`
+    SELECT telegram_chat_id, title, created_at, updated_at
+    FROM tg_groups
+    ORDER BY updated_at DESC
+    LIMIT 200
+  `);
+  res.json(r.rows);
+});
+
+/**
+ * Broadcast:
+ * - Select recipients from DB
+ * - Send to bot internal endpoint for delivery
+ */
+app.post("/admin/broadcast", requireAdmin, async (req, res) => {
+  const { message, audience, limit } = req.body || {};
+  if (!message || typeof message !== "string") return res.status(400).json({ error: "message required" });
+
+  const aud = (audience || "ALL").toUpperCase(); // ALL | IMPORTANT
+  const lim = Math.min(Math.max(Number(limit || 200), 1), 2000);
+
+  // recipients: must have started bot + opted in
+  // dm_pref filter: IMPORTANT only targets dm_pref=IMPORTANT or ALL? (we do IMPORTANT only)
+  let where = `WHERE dm_opt_in = true`;
+  const params = [];
+  if (aud === "IMPORTANT") where += ` AND dm_pref = 'IMPORTANT'`;
+
+  const r = await pool.query(
+    `
+    SELECT telegram_user_id
+    FROM telegram_users
+    ${where}
+    ORDER BY updated_at DESC
+    LIMIT ${lim}
+    `
+  );
+
+  const recipients = r.rows.map((x) => Number(x.telegram_user_id));
+
+  if (!BOT_INTERNAL_KEY || !BOT_SERVICE_URL) {
+    return res.status(500).json({ error: "Broadcast not configured (missing BOT_INTERNAL_KEY or BOT_SERVICE_URL)" });
+  }
+
+  // call bot internal endpoint
+  const resp = await fetch(`${BOT_SERVICE_URL}/internal/broadcast`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-internal-key": BOT_INTERNAL_KEY,
+    },
+    body: JSON.stringify({ message, recipients }),
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    return res.status(502).json({ error: "Bot delivery failed", status: resp.status, details: txt });
+  }
+
+  const out = await resp.json().catch(() => ({}));
+  res.json({ ok: true, selected: recipients.length, delivery: out });
 });
 
 app.listen(PORT, async () => {
