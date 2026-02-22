@@ -65,6 +65,22 @@ bot.command("xchange", async (ctx) => {
   await ctx.reply("Send your new X (Twitter) username starting with @ (Example: @airdropsfather)");
 });
 
+// Auto-register groups when bot membership changes
+bot.on("my_chat_member", async (ctx) => {
+  try {
+    await upsertGroup(ctx.chat);
+  } catch {}
+});
+
+// Also register when bot is added as a new member (some groups send this instead)
+bot.on("new_chat_members", async (ctx) => {
+  try {
+    const me = await bot.telegram.getMe();
+    const added = (ctx.message?.new_chat_members || []).some(m => m.id === me.id);
+    if (added) await upsertGroup(ctx.chat);
+  } catch {}
+});
+
 bot.start(async (ctx) => {
   const u = ctx.from;
   if (!u) return;
