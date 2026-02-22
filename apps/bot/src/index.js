@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import { Telegraf, Markup } from "telegraf";
 
-const VERSION = "v1.1.0-verified-skip";
+const VERSION = "v1.1.1-full";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
@@ -17,11 +17,8 @@ const BOT_INTERNAL_KEY = process.env.BOT_INTERNAL_KEY;
 
 if (!API_BASE_URL) console.warn("WARNING: Missing API_BASE_URL");
 if (!BOT_API_KEY) console.warn("WARNING: Missing BOT_API_KEY");
-if (!BOT_INTERNAL_KEY) console.warn("WARNING: Missing BOT_INTERNAL_KEY (broadcast disabled)");
 
 const bot = new Telegraf(TOKEN);
-
-// cache (optional)
 const state = new Map(); // telegramUserId -> { dmOptIn, dmPref, xHandle }
 
 function hasBotAuth() {
@@ -44,11 +41,7 @@ async function getExistingUser(telegramUserId) {
   if (!hasBotAuth()) return null;
   const res = await apiFetch(`/tg/users/${telegramUserId}`, { method: "GET" });
   if (res.status === 404) return null;
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    console.error("API lookup failed", res.status, txt);
-    return null;
-  }
+  if (!res.ok) return null;
   return res.json().catch(() => null);
 }
 
@@ -68,22 +61,16 @@ async function upsertUser(ctx, extra = {}) {
 
   state.set(u.id, { dmOptIn: payload.dmOptIn, dmPref: payload.dmPref, xHandle: payload.xHandle });
 
-  const res = await apiFetch("/tg/users/upsert", {
+  await apiFetch("/tg/users/upsert", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  });
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    console.error("API upsert failed", res.status, txt);
-  }
+  }).catch(() => {});
 }
 
-// ✅ Your rule: tg username + x_handle present => verified
+// ✅ Your rule: if tg username + x_handle exist -> verified, NEVER ask again
 function isVerified(dbUser) {
-  if (!dbUser) return false;
-  return !!(dbUser.telegram_username && dbUser.x_handle);
+  return !!(dbUser && dbUser.telegram_username && dbUser.x_handle);
 }
 
 function optInKeyboard() {
@@ -98,23 +85,15 @@ bot.command("version", async (ctx) => {
 });
 
 bot.start(async (ctx) => {
-  const text = ctx.message?.text || "";
-  const payload = (text.split(" ")[1] || "");
-
-  // upsert basics first (captures telegram username)
+  // Upsert basics first (captures tg username)
   await upsertUser(ctx);
 
-  // lookup after upsert
   const existing = await getExistingUser(ctx.from.id);
-
-  // If verified, NEVER ask again (even without verify payload)
   if (isVerified(existing)) {
     await ctx.reply(`✅ You are already verified.\n\nTG: @${existing.telegram_username}\nX: ${existing.x_handle}`);
     return;
   }
 
-  // Not verified yet -> proceed with flow
-  // If they came via verify deep-link or normal /start, same screen
   await ctx.reply(
     "Welcome to AirdropsFather.\n\nDo you want to receive giveaway notifications via DM?",
     optInKeyboard()
@@ -145,7 +124,6 @@ bot.action("optin_no", async (ctx) => {
 bot.on("text", async (ctx) => {
   const msg = ctx.message.text.trim();
 
-  // If already verified, ignore extra input (we can add /update later)
   const existing = await getExistingUser(ctx.from.id);
   if (isVerified(existing)) return;
 
@@ -162,40 +140,7 @@ bot.on("text", async (ctx) => {
   }
 });
 
-bot.on("my_chat_member", async (ctx) => {
-  const chat = ctx.chat;
-  if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) return;
-
-  const newStatus = ctx.update.my_chat_member?.new_chat_member?.status;
-  if (newStatus === "member" || newStatus === "administrator") {
-    try {
-      if (hasBotAuth()) {
-        const res = await apiFetch("/tg/groups/upsert", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ telegramChatId: chat.id, title: chat.title || null }),
-        });
-        if (!res.ok) console.error("group upsert failed", res.status);
-      }
-
-      const link = `https://t.me/${bot.botInfo?.username}?start=verify_${chat.id}`;
-      await ctx.telegram.sendMessage(chat.id, [
-        "✅ *AirdropsFather Verification*",
-        "",
-        "Tap the button below to verify and receive giveaway notifications.",
-        "",
-        "_Note: The bot can DM you only after you start a chat._",
-      ].join("\n"), {
-        parse_mode: "Markdown",
-        ...Markup.inlineKeyboard([[Markup.button.url("Verify & Enable Notifications", link)]]),
-      });
-    } catch (e) {
-      console.error("Failed to onboard group", e?.message || e);
-    }
-  }
-});
-
-// internal broadcast endpoint (API calls this)
+// internal broadcast endpoint
 const app = express();
 app.use(express.json());
 
@@ -211,11 +156,10 @@ app.post("/internal/broadcast", async (req, res) => {
   const results = { ok: 0, fail: 0 };
   for (const chatId of recipients) {
     try {
-      await bot.telegram.sendMessage(chatId, message, { disable_web_page_preview: false });
+      await bot.telegram.sendMessage(chatId, message);
       results.ok += 1;
-    } catch (e) {
+    } catch {
       results.fail += 1;
-      console.error("broadcast failed for", chatId, e?.message || e);
     }
   }
   res.json(results);
